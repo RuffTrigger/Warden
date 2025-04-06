@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Timers;
-using Mono.Data.Sqlite;
 using Terraria;
 using TerrariaApi.Server;
 using TShockAPI;
@@ -22,14 +21,10 @@ namespace Warden
         private readonly int scanInterval = 1500;
         private static readonly HashSet<int> illegalItemTypes = new HashSet<int>
         {
-            3988, // Alpha Bug Net (unobtainable through normal gameplay)
-            // Add more unobtainable/debug items here as needed
+            3988, // Alpha Bug Net (unobtainable)
         };
 
         private const int MaxStackLimit = 9999;
-
-        private string dbPath = Path.Combine(TShock.SavePath, "ItemTracker.sqlite");
-        private SqliteConnection db;
 
         public Warden(Main game) : base(game)
         {
@@ -38,11 +33,12 @@ namespace Warden
 
         public override void Initialize()
         {
+            EnsureDatabaseSchema();
+
             playerScanTimer = new Timer(scanInterval);
             playerScanTimer.Elapsed += PlayerScan;
             playerScanTimer.Start();
 
-            ServerApi.Hooks.GameInitialize.Register(this, OnGameInitialize);
             ServerApi.Hooks.NetGetData.Register(this, OnGetData);
         }
 
@@ -52,21 +48,31 @@ namespace Warden
             {
                 playerScanTimer.Stop();
                 playerScanTimer.Dispose();
-                db?.Close();
 
-                ServerApi.Hooks.GameInitialize.Deregister(this, OnGameInitialize);
                 ServerApi.Hooks.NetGetData.Deregister(this, OnGetData);
             }
             base.Dispose(disposing);
         }
 
-        private void OnGameInitialize(EventArgs args)
+        private void EnsureDatabaseSchema()
         {
-            db = new SqliteConnection("Data Source=" + dbPath);
-            db.Open();
-            using (var cmd = new SqliteCommand("CREATE TABLE IF NOT EXISTS TrackedItems (Id INTEGER PRIMARY KEY AUTOINCREMENT, UniqueIdentifier TEXT NOT NULL, ItemID INTEGER NOT NULL, Stack INTEGER, Source TEXT, CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP);", db))
+            var sql = @"
+                CREATE TABLE IF NOT EXISTS TrackedItems (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    UniqueIdentifier TEXT NOT NULL,
+                    ItemID INTEGER NOT NULL,
+                    Stack INTEGER,
+                    Source TEXT,
+                    CreatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+                );";
+
+            try
             {
-                cmd.ExecuteNonQuery();
+                TShock.DB.Query(sql);
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.ConsoleError($"[Warden] Error ensuring database schema: {ex.Message}");
             }
         }
 
@@ -96,64 +102,15 @@ namespace Warden
                 }
                 catch (Exception ex)
                 {
-                    TShock.Log.ConsoleError("[Warden] Error parsing item drop: " + ex.Message);
+                    TShock.Log.ConsoleError($"[Warden] Error parsing item drop: {ex.Message}");
                 }
             }
         }
 
         private void StoreItem(string uid, int itemId, int stack, string source)
         {
-            using (var cmd = new SqliteCommand("INSERT INTO TrackedItems (UniqueIdentifier, ItemID, Stack, Source) VALUES (@uid, @itemId, @stack, @source);", db))
-            {
-                cmd.Parameters.AddWithValue("@uid", uid);
-                cmd.Parameters.AddWithValue("@itemId", itemId);
-                cmd.Parameters.AddWithValue("@stack", stack);
-                cmd.Parameters.AddWithValue("@source", source);
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        private static bool CheckBans(string username)
-        {
-            using (var reader = TShock.DB.QueryReader("SELECT * FROM Bans WHERE Name = @0", username))
-            {
-                return reader.Read();
-            }
-        }
-
-        public static void BanTheCheaters(string ip, string username, UserAccount userAccount)
-        {
-            if (string.IsNullOrWhiteSpace(ip) || string.IsNullOrWhiteSpace(username))
-                return;
-
-            try
-            {
-                if (!CheckBans(username))
-                {
-                    Console.WriteLine("Cheater detected - banning");
-                    string banReason = "Item hacks";
-
-                    int playerId = -1;
-                    string playerUUID = string.Empty;
-
-                    using (var reader = TShock.DB.QueryReader("SELECT * FROM Users WHERE Username = @0", username))
-                    {
-                        if (reader.Read())
-                        {
-                            playerId = reader.Get<int>("ID");
-                            playerUUID = reader.Get<string>("UUID");
-                        }
-                    }
-
-                    TShock.Bans.InsertBan(playerUUID, banReason, "Warden", DateTime.Now, DateTime.MaxValue);
-                    TSPlayer.All.SendMessage($"# # # {username} was banned due to item hacks... Goodbye! # # #", 205, 0, 55);
-                }
-            }
-            catch (Exception ex)
-            {
-                TShock.Log.Error(ex.ToString());
-                Console.WriteLine(ex.ToString());
-            }
+            TShock.DB.Query("INSERT INTO TrackedItems (UniqueIdentifier, ItemID, Stack, Source) VALUES (@0, @1, @2, @3);",
+                            uid, itemId, stack, source);
         }
 
         private void PlayerScan(object sender, ElapsedEventArgs e)
@@ -175,12 +132,7 @@ namespace Warden
         {
             foreach (var item in player.TPlayer.inventory)
             {
-                if (item.active && IsIllegalItem(item.type))
-                {
-                    return true;
-                }
-
-                if (item.active && item.stack > MaxStackLimit)
+                if (item.active && (illegalItemTypes.Contains(item.type) || item.stack > MaxStackLimit))
                 {
                     return true;
                 }
@@ -188,41 +140,40 @@ namespace Warden
             return false;
         }
 
-        private static bool IsIllegalItem(int itemType)
+        public static void BanTheCheaters(string ip, string username, UserAccount userAccount)
         {
-            return illegalItemTypes.Contains(itemType);
+            if (string.IsNullOrWhiteSpace(username))
+                return;
+
+            try
+            {
+                var existingBan = TShock.DB.QueryScalar<int>("SELECT COUNT(*) FROM Bans WHERE Name=@0", username);
+                if (existingBan == 0)
+                {
+                    string banReason = "Item hacks";
+                    TShock.Bans.InsertBan(userAccount.UUID, banReason, "Warden", DateTime.UtcNow, DateTime.MaxValue);
+                    TSPlayer.All.SendMessage($"{username} was banned due to item hacks.", 205, 0, 55);
+                }
+            }
+            catch (Exception ex)
+            {
+                TShock.Log.Error(ex.ToString());
+            }
         }
 
         private void PurgeUntrackedItems(TSPlayer player)
         {
-            var tPlayer = player.TPlayer;
-            bool inventoryChanged = false;
-
-            for (int i = 0; i < tPlayer.inventory.Length; i++)
+            var inventory = player.TPlayer.inventory;
+            for (int i = 0; i < inventory.Length; i++)
             {
-                var item = tPlayer.inventory[i];
-                if (item != null && item.netID != 0 && item.stack > 0)
-                {
-                    using (var cmd = new SqliteCommand("SELECT COUNT(*) FROM TrackedItems WHERE ItemID = @id AND Stack = @stack LIMIT 1", db))
-                    {
-                        cmd.Parameters.AddWithValue("@id", item.netID);
-                        cmd.Parameters.AddWithValue("@stack", item.stack);
+                var item = inventory[i];
+                if (item == null || item.netID == 0 || item.stack <= 0) continue;
 
-                        var result = Convert.ToInt32(cmd.ExecuteScalar());
-                        if (result == 0)
-                        {
-                            tPlayer.inventory[i].SetDefaults(0);
-                            inventoryChanged = true;
-                            player.SendWarningMessage($"Untracked item removed: {item.Name}");
-                        }
-                    }
-                }
-            }
-
-            if (inventoryChanged)
-            {
-                for (int i = 0; i < NetItem.MaxInventory; i++)
+                var result = TShock.DB.QueryScalar<int>("SELECT COUNT(*) FROM TrackedItems WHERE ItemID = @0 AND Stack = @1 LIMIT 1", item.netID, item.stack);
+                if (result == 0)
                 {
+                    inventory[i].SetDefaults(0);
+                    player.SendWarningMessage($"Untracked item removed: {item.Name}");
                     NetMessage.SendData((int)PacketTypes.PlayerSlot, -1, -1, null, player.Index, i);
                 }
             }
